@@ -1,0 +1,4 @@
+services:
+  web-extra:
+    image: nopush/podman-compose-test
+    command: ["dumb-init", "/bin/busybox", "httpd", "-f", "-h", ".", "-p", "8006"]

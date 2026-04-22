@@ -1,0 +1,6 @@
+# Tests long-form include syntax.
+# web-commons is resolved through an explicit env_file; web-extra uses default lookup.
+include:
+  - path: ./commons/compose.yaml
+    env_file: ./commons/.env
+  - path: ./extra/compose.yaml

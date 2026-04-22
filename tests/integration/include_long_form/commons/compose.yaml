@@ -1,0 +1,4 @@
+services:
+  web-commons:
+    image: ${COMMONS_IMAGE}
+    command: ["dumb-init", "/bin/busybox", "httpd", "-f", "-h", ".", "-p", "8005"]

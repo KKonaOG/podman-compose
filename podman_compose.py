@@ -2508,6 +2508,110 @@ class PodmanCompose:
             set_if_not_already_set(PodmanCompose.XPodmanSettingKey.NAME_SEPARATOR_COMPAT, True)
             set_if_not_already_set(PodmanCompose.XPodmanSettingKey.IN_POD, False)
 
+    def _process_include_entry(
+        self,
+        include_entry: str | dict[str, Any],
+        parent_environ: dict[str, Any],
+        parent_filename: str,
+    ) -> dict[str, Any]:
+        """Process a single include entry (short or long syntax) and return merged content.
+
+        Short syntax: a plain file path string.
+        Long syntax: a dict with required ``path`` and optional ``project_directory``
+        and ``env_file`` keys.  ``path`` and ``env_file`` may each be a string or a
+        list of strings.  ``project_directory`` defaults to the directory of the first
+        file in ``path``.  ``env_file`` defaults to ``.env`` inside
+        ``project_directory``.  The parent project's environment always overrides
+        values loaded from ``env_file``.
+        """
+        parent_dir = os.path.realpath(os.path.dirname(parent_filename))
+
+        if isinstance(include_entry, str):
+            raw_path = include_entry
+            path_list = [
+                raw_path if os.path.isabs(raw_path) else os.path.join(parent_dir, raw_path)
+            ]
+            project_directory = os.path.realpath(os.path.dirname(path_list[0]))
+            env_file_list: list[str] | None = None
+        else:
+            raw_path = include_entry.get("path")
+            if raw_path is None:
+                log.fatal("'include' entry is missing required 'path' field")
+                sys.exit(1)
+            raw_path_list = [raw_path] if isinstance(raw_path, str) else list(raw_path)
+            path_list = [
+                p if os.path.isabs(p) else os.path.join(parent_dir, p)
+                for p in raw_path_list
+            ]
+            path_list = [os.path.realpath(p) for p in path_list]
+
+            raw_project_dir = include_entry.get("project_directory")
+            if raw_project_dir:
+                project_directory = os.path.realpath(
+                    raw_project_dir
+                    if os.path.isabs(raw_project_dir)
+                    else os.path.join(parent_dir, raw_project_dir)
+                )
+            else:
+                project_directory = os.path.realpath(os.path.dirname(path_list[0]))
+
+            raw_env_file = include_entry.get("env_file")
+            if raw_env_file is None:
+                env_file_list = None
+            else:
+                ef_raw_list = (
+                    [raw_env_file] if isinstance(raw_env_file, str) else list(raw_env_file)
+                )
+                env_file_list = [
+                    ef if os.path.isabs(ef) else os.path.join(project_directory, ef)
+                    for ef in ef_raw_list
+                ]
+
+        # Build sub-environment: env_file values are defaults, parent env overrides them.
+        sub_environ: dict[str, Any] = {}
+        if env_file_list is None:
+            default_env = os.path.join(project_directory, ".env")
+            if os.path.exists(default_env):
+                sub_environ.update(dotenv_to_dict(default_env))
+        else:
+            for ef in env_file_list:
+                sub_environ.update(dotenv_to_dict(ef))
+        sub_environ.update(parent_environ)
+
+        merged_content: dict[str, Any] = {}
+        for filepath in path_list:
+            if not os.path.exists(filepath):
+                log.fatal("included file not found: %s", filepath)
+                sys.exit(1)
+            with open(filepath, encoding="utf-8") as f:
+                content = load_yaml_or_die(filepath, f)
+            if not isinstance(content, dict):
+                log.fatal(
+                    "included compose file does not contain a top-level object: %s", filepath
+                )
+                sys.exit(1)
+            content = normalize(content)
+            if isinstance(content.get("services"), dict):
+                for service in content["services"].values():
+                    if not isinstance(service, (OverrideTag, ResetTag)):
+                        if "extends" in service and (
+                            service_file := service["extends"].get("file")
+                        ):
+                            service["extends"]["file"] = os.path.join(
+                                os.path.dirname(filepath), service_file
+                            )
+            content = rec_subs(content, sub_environ)
+            nested_includes = content.pop("include", None)
+            rec_merge(merged_content, content)
+            if nested_includes:
+                for nested_entry in nested_includes:
+                    nested_content = self._process_include_entry(
+                        nested_entry, sub_environ, filepath
+                    )
+                    rec_merge(merged_content, nested_content)
+
+        return merged_content
+
     def _parse_compose_file(self) -> None:
         args = self.global_args
         # cmd = args.command
@@ -2635,17 +2739,17 @@ class PodmanCompose:
                                 os.path.dirname(filename), service_file
                             )
 
+            # Extract include entries before merging so relative paths resolve to this file.
+            # Paths have already been substituted by rec_subs above.
+            include_raw = content.pop("include", None)
             rec_merge(compose, content)
-            # If `include` is used, append included files to files
-            include = compose.get("include")
-            if include:
-                files.extend([os.path.join(os.path.dirname(filename), i) for i in include])
-                # As compose obj is updated and tested with every loop, not deleting `include`
-                # from it, results in it being tested again and again, original values for
-                # `include` be appended to `files`, and, included files be processed for ever.
-                # Solution is to remove 'include' key from compose obj. This doesn't break
-                # having `include` present and correctly processed in included files
-                del compose["include"]
+            if include_raw:
+                include_entries: list[str | dict[str, Any]] = (
+                    include_raw if isinstance(include_raw, list) else [include_raw]
+                )
+                for entry in include_entries:
+                    included = self._process_include_entry(entry, self.environ, filename)
+                    rec_merge(compose, included)
         resolved_services = self._resolve_profiles(
             compose.get("services") or {}, requested_profiles
         )
